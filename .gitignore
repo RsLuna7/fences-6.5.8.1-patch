@@ -1,0 +1,17 @@
+# No binaries are archived here — only patch instructions against files you supply.
+# Keep it that way: this repository must never carry Stardock code.
+*.exe
+*.dll
+*.sig
+*.spak
+*.dat
+
+# Patch working artifacts
+*.orig-backup
+*.locked-old
+*.patched-new
+*.restoring
+
+# Local notes
+.tmp/
+*.local.md
