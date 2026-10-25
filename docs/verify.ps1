@@ -133,8 +133,8 @@ try {
     Write-Host 'SKU flags' -ForegroundColor Cyan
     foreach ($prop in @('IsBusinessSku', 'IsODNTSKU')) {
         $val = $featuresT.GetProperty($prop).GetValue($null)
-        Write-Info ("{0,-16} = {1}" -f $prop, $val)
-        if (-not $val) { $failures++ }
+        Write-Info ("{0,-16} = {1} (expected: False)" -f $prop, $val)
+        if ($val) { $failures++; Write-Bad "FAIL: $prop should remain False to avoid kiosk locking" } else { Write-Ok "$prop is cleanly disabled (safe)" }
     }
 
     # ------------------------------------------------------------------
@@ -191,3 +191,5 @@ if ($failures -eq 0) {
     Write-Host "$failures check(s) failed." -ForegroundColor Red
     exit 1
 }
+
+

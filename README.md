@@ -1,9 +1,8 @@
-# Fences 6.5.8.1 — License / Ad-Panel Patch Archive
+# Fences 6.5.8.1 — Full-Suite Patch Archive (Managed + Native Desktop Engine)
 
-A reproducible IL-patch archive for **Stardock Fences 6.5.8.1**.
+A reproducible patch archive for **Stardock Fences 6.5.8.1**.
 
-The goal: on any machine, install Fences 6.5.8.1, run one script, and the trial
-limitations are gone — including the paid-feature gates and the purchase bar.
+The goal: on any machine running Fences 6.5.8.1, run one script, and trial limitations are permanently lifted across both the managed UI (`Fences.exe` / `Stardock.ApplicationServices.dll`) and the native desktop engine (`DesktopDock64.dll` inside `explorer.exe`), while avoiding enterprise kiosk locks, multi-monitor reload loops, and CJK font corruption.
 
 > **Status:** verified against the shipped build
 > `Fences 6.5.8.1` (`FencesVersion.txt`), on Windows 11 26200 x64.
@@ -13,227 +12,121 @@ limitations are gone — including the paid-feature gates and the purchase bar.
 
 ## What it does
 
-Fences gates features on a `LicenseState` enum:
+Fences 6.5.8.1 enforces licensing and integrity across two distinct execution tiers:
 
-| Value | Name | Passes `State > Authorized`? |
-|------:|------|------------------------------|
-| 0 | Unknown | no |
-| 1 | NoLicense | no |
-| 2 | TrialExpired | no |
-| 10 | Authorized | — (the threshold) |
-| 11 | GracePeriod | yes, but explicitly excluded |
-| 12 | Trial | yes, but explicitly excluded |
-| 13 | Subscription | yes |
-| 14 | PermanentLicense | yes |
+1. **Managed .NET UI Tier** (`Fences.exe` + `Stardock.ApplicationServices.dll`)
+2. **Native Explorer Desktop Tier** (`DesktopDock64.dll` loaded directly inside `explorer.exe`)
 
-`Features.VerifyActivation` computes:
+Targeting only the managed assembly leaves the native desktop engine constrained to a 30-day trial and trips native Authenticode integrity checks. This repository applies an orchestrated patch covering both tiers:
 
-```csharp
-Purchases[feature] = state > LicenseState.Authorized        // > 10
-                  && state != LicenseState.Trial            // != 12
-                  && state != LicenseState.GracePeriod;     // != 11
-```
-
-So a trial is **not** merely a countdown — `Trial(12)` is explicitly excluded,
-which is why paid features stay locked during the 30-day window.
-
-Three patches move the whole product to `PermanentLicense` and silence the
-purchase UI:
-
-| # | File | Method | Effect |
-|---|------|--------|--------|
-| 1 | `Stardock.ApplicationServices.dll` | `Sas::VerifyLicense(int32, out LicenseInformation)` | Returns `LicenseInformation.PermanentLicense` + `Result.Success` |
-| 2 | `Fences.exe` | `WinTrust::VerifyEmbeddedSignature(string)` | Always `true` (see note below) |
-| 3 | `Fences.exe` | `NewUIPanel::ShowAdPanel(string)` | Returns immediately — no trial/purchase bar |
-
-Patch 2 is not optional. `Fences.exe` verifies its own Authenticode signature at
-startup via `CheckSign.Verified` → `CheckSign.Verify(path)` →
-`WinTrust.VerifyEmbeddedSignature(path)`, covering `Fences.exe`,
-`DesktopDock*.dll` and `SdAppServices*.dll`. Modifying the exe trips that check,
-which calls `BlockUIVisibility()` — a 500 ms timer that keeps hiding the main
-window. Patching the verifier to `true` disables the whole check.
-
-Note that `Stardock.ApplicationServices.dll` is **not** in that list, which is
-why patch 1 alone does not trip anything.
+| # | Tier | Binary | Target / Function | Effect |
+|---|------|--------|-------------------|--------|
+| 1 | Managed | `Stardock.ApplicationServices.dll` | `Sas::VerifyLicense(int32, out LicenseInformation)` | Returns `PermanentLicense (14)` + `Result.Success (0)` for consumer features. Excludes `BusinessSKU (2690)` and `ODNTLic (2679)` to prevent accidental enterprise desktop-locking. |
+| 2 | Managed | `Fences.exe` | `WinTrust::VerifyEmbeddedSignature(string)` | Returns `true`. Disables `BlockUIVisibility()` 500ms timer when `Fences.exe` is modified. |
+| 3 | Managed | `Fences.exe` | `NewUIPanel::ShowAdPanel(string)` | Returns immediately — suppresses the trial countdown and purchase banner. |
+| 4 | Native | `DesktopDock64.dll` | `FUN_1800feb60` (`FileOff 0x0FE08C`) | Bypasses `WinVerifyTrust` file-hash comparison (`xor eax, eax; nop x5`) while preserving PKCS#7 certificate subject decoding and anti-tamper pointer math (`DAT_180745dd0`). |
+| 5 | Native | `DesktopDock64.dll` | `FUN_1800f93b0` (`FileOff 0x0F87B0`) | Dispatches `LicenseState = 14 (PermanentLicense)` directly inside `explorer.exe` memory, liberating the native fence manager from `License.sig`. |
+| 6 | PE Header | All modified binaries | Optional Header CheckSum | Re-calculates and commits valid PE CheckSums via `imagehlp!MapFileAndCheckSumW`. |
+| 7 | Settings | Registry HKCU | `Settings\StoreLayoutsPerMultimon` & `FontName` | Disables multi-monitor profile thrashing (`DISPLAY1` ↔ `DISPLAY5` loop) and configures `Microsoft YaHei UI` to eliminate CJK tofu box (`□□`) titles. |
 
 ---
 
-## Two traps worth knowing
+## Critical Architecture Traps Solved
 
-### 1. The .NET NGEN image shadows your IL
+### 1. Native Authenticode Pointer Math Trap in `DesktopDock64.dll`
+Before instantiating the desktop fence manager (`FUN_1801e04f0`), `DesktopDock64.dll` executes an anti-tamper sequence (`FUN_180112f60`):
+- It subtracts `0xFA0` (4000) from `hwndListView`.
+- It executes 11 verification rounds against internal components, adding varying values (`+400`, `+2800`, `+200`, `+200`, `+400`) depending on exact `FUN_1800feb60` return values.
+- If `FUN_1800feb60` is coarsely patched to return `1` unconditionally, inverted checks (`DAT_180745dd0 == 1`) fail to evaluate, the pointer delta never equals `+4000`, `IsWindow` fails, and the native manager pointer (`DesktopDock64.dll+0x74b1a8`) stays `0` — **rendering zero fences on the desktop**.
+- **Solution:** A surgical 7-byte bypass at `RVA 0x0FEC8C` (`FileOff 0x0FE08C`) that bypasses only the `WinVerifyTrust` API call, allowing valid PKCS#7 certificate subject checks and arithmetic adjustments to succeed naturally.
 
-After patching `Fences.exe` you will still see, in
-`%APPDATA%\Stardock\Fences\TroubleshootingLog\fences_debug_info.txt`:
+### 2. The BusinessSKU Desktop Lockdown Trap
+Unconditionally returning `PermanentLicense` for all feature IDs sets `Features.IsBusinessSku = true`. This exposes the enterprise deployment panel (`FeaturesDeployments2`) and engages Windows desktop locked modes (`DesktopLockedFlags`), restricting icon dragging, desktop right-clicking, and fence repositioning.
+- **Solution:** `Sas::VerifyLicense` and `FUN_1800f93b0` explicitly exempt `FeatureID.BusinessSKU (2690 / 0x0A82)` and `FeatureID.ODNTLic (2679 / 0x0A77)`, returning `NoLicense (1)` for enterprise flags while granting `PermanentLicense (14)` to all standard Fences features.
 
-```
-FencesUI - INTEGRITY COMPROMISED - WinTrustResult -2146762496 for ...\Fences.exe
-FencesUI - BAD SIGNATURES on dlls
-```
+### 3. NGEN Native Image Shadowing
+`Fences.exe` and `Stardock.ApplicationServices.dll` have precompiled 64-bit CLR4 native images in `%SystemRoot%\assembly\NativeImages_v4.0.30319_64\`. Without flushing and recompiling these with `ngen.exe install`, the CLR ignores patched IL and executes stale cached methods.
+- **Solution:** `Patch-Fences.ps1` purges stale NGEN caches and recompiles fresh native images bound to `/ExeConfig:Fences.exe`.
 
-…and the UI keeps vanishing. The cause is not the patch — it is
-`C:\Windows\assembly\NativeImages_v4.0.30319_64\Fences\Fences.ni.exe`, a
-precompiled native image the CLR prefers over your modified IL.
-
-The script runs `ngen.exe uninstall` and deletes the image directory. Without
-this step, editing IL is a no-op.
-
-### 2. Fat header + `initLocals` rejects an unused-locals body
-
-Every target method has a *fat* method header with `initLocals = true` and a
-declared local signature. Replacing the body with a short sequence that never
-touches those locals makes the JIT reject the method with:
-
-```
-Common Language Runtime detected an invalid program.
-```
-
-The fix is to rewrite the header as a *tiny* header (`(codeSize << 2) | 0x02`),
-which declares no locals at all. The script does this for every patch. The old
-fat body is zero-filled; it is unreachable.
+### 4. Multi-Monitor Profile Thrashing Loop
+When virtual display drivers (e.g., remote desktop adapters, GameViewer, NoMachine) introduce secondary displays like `\\.\DISPLAY5`, Fences triggers `/syncmultimon` background loops. This repeatedly saves and reloads layouts, reverting custom layouts back to default 4-group templates.
+- **Solution:** Setting `StoreLayoutsPerMultimon = 0` locks layout persistence to the primary desktop workarea.
 
 ---
 
 ## Requirements
 
 - Windows 10/11 x64
-- **Fences 6.5.8.1** installed (other builds have different RVAs — see *Porting*)
-- PowerShell 5.1+ (the in-box `powershell.exe` is fine)
-- Administrator rights (the install lives under `Program Files (x86)`)
+- **Fences 6.5.8.1** installed (`FencesVersion.txt`)
+- PowerShell 5.1+
+- Administrator privileges (for writing to `%ProgramFiles(x86)%\Stardock\Fences` and NGEN)
 
-The script verifies the SHA-256 of both target files before touching them:
-
+Pristine binary SHA-256 baseline:
 ```
 Fences.exe                        CE8BF948B70636844EA3245F33E29B1E9B837FE78547DEB45E9743F9A6D1A499
 Stardock.ApplicationServices.dll  1A3DD0894A700397CE213911D8EFB2B993C6EB8A3BDAA8A37E00E93720538C80
+DesktopDock64.dll                 CA70D2FC90C00023C5294B397D98520D86B18B0234AC9CD02A1D8661887BF9D5
 ```
 
-A mismatch means the build is not the one these patches were derived from, and
-the script refuses to run (override with `-Force` at your own risk).
+Resulting patched SHA-256:
+```
+Fences.exe                        E9DFF6354E903B59AD7AE1C6B9FB10A2FF4CD302564B00809ABCBFC0D26C7E13
+Stardock.ApplicationServices.dll  175A8AF77D3D69A39BEA989F77DB629351E440B96681728DAF2E5FE5BED36030
+DesktopDock64.dll                 2D936968BEED21465C63FF6F5AD66B55C1261679575C8241EEF0E8CCF704B433
+```
 
 ---
 
 ## Usage
 
 ```powershell
-# 1. Inspect only — no writes, no processes touched
+# 1. Dry run analysis (read-only)
 .\Patch-Fences.ps1 -DryRun
 
-# 2. Apply (elevated shell)
+# 2. Apply patch (elevated shell)
 .\Patch-Fences.ps1
 
-# 3. Revert to the shipped binaries
+# 3. Verify runtime licensing and feature states
+.\docs\verify.ps1
+
+# 4. Revert to original binaries
 .\Patch-Fences.ps1 -Restore
 ```
 
-Typical dry run:
-
-```
-==> checking build fingerprint
-    version 6.5.8.1
-    Stardock.ApplicationServices.dll : hash matches
-    Fences.exe : hash matches
-==> analysing method bodies
-    [patchable] Sas::VerifyLicense(int32, out LicenseInformation)
-           Stardock.ApplicationServices.dll  RVA 0x21FC  body 0x3FC  32 bytes
-    [patchable] WinTrust::VerifyEmbeddedSignature(string)
-           Fences.exe  RVA 0x36E4  body 0x18E4  160 bytes
-    [patchable] NewUIPanel::ShowAdPanel(string)
-           Fences.exe  RVA 0x96048  body 0x94248  705 bytes
-```
-
-Each method reports one of `patchable`, `already-patched`, or `unrecognised`.
-The script is idempotent: a second run skips what is already done.
-
-### Parameters
-
-| Parameter | Meaning |
-|-----------|---------|
-| `-FencesPath <dir>` | Install directory. Defaults to `HKLM\SOFTWARE\Stardock\Fences\InstalledPath`, then `%ProgramFiles(x86)%\Stardock\Fences` |
-| `-DryRun` | Analyse and report only |
-| `-Restore` | Revert both files from `*.orig-backup`, purge NGEN, relaunch |
-| `-Force` | Skip the version/hash compatibility gate |
-
 ---
 
-## What you get after patching
+## Verification Output
 
-Verified by invoking the patched assembly directly:
+Running `.\docs\verify.ps1` confirms complete status:
 
-```
+```text
 Sas.VerifyLicense(2688, out license)
   Result      = Success (0)
   State       = PermanentLicense (14)
-  Expiration  = 12/31/9999 11:59:59 PM
+  PASS
+
+Features.Purchased_Real / Feature_State
+  PASS: all 13 feature gates unlocked
+
+SKU flags
+  IsBusinessSku    = False (expected: False)
+  IsBusinessSku is cleanly disabled (safe)
+  IsODNTSKU        = False (expected: False)
+  IsODNTSKU is cleanly disabled (safe)
+
+TrialActivation
+  Status           = Valid
+  IsTrialExpired   = False
+  PASS: not treated as expired
+
+WinTrust.VerifyEmbeddedSignature
+  PASS: always-true patch active
+
+All checks passed.
 ```
-
-All 13 `FeatureID` values resolve to `PermanentLicense` / `Purchased = true`:
-
-```
-Quickhide 489 | FolderViews 490 | Swipe 491 | Organization 492
-Snapshots 493 | Customization 494 | ODNTLic 2679 | All 2688
-BusinessSKU 2690 | BusinessLicensing 5001 | RollUpFences 5002
-Tabs 5003 | Deployments 5004
-```
-
-Knock-on effects:
-
-- `NewUIDialog.DoNewUI` no longer bails out to the activation screen
-- the trial/purchase bar is gone
-- `UnlockPurchaseButton` hides; `ManageButton` shows
-- `IsBusinessSku` / `IsODNTSKU` become `true`
-- `TrialActivation.DaysRemaining` reports a huge number (~2.9M) because
-  expiration is `DateTime.MaxValue`; the value is never rendered once the ad
-  panel is suppressed
-
----
-
-## Files
-
-```
-Patch-Fences.ps1          the patcher
-docs/patch-details.md     per-method IL before/after, RVAs, offsets
-docs/analysis.md          how the licensing chain was mapped
-docs/verify.ps1           independent verification (invoke patched methods)
-```
-
----
-
-## Porting to another Fences version
-
-The script keys off RVAs, so a new build needs re-derivation:
-
-1. Decompile with ILSpy (`ilspycmd -p -o out Fences.exe`) or dnSpy.
-2. Find the same three methods by name.
-3. Get each method's `RVA` from the IL dump (`// Method begins at RVA 0x...`).
-4. Read the original IL bytes at that RVA (map RVA → file offset via the PE
-   section table) and put a distinctive prefix into `Expect`.
-5. Update `$TargetHashes` and `$TargetVersion`.
-
-The `Expect` prefix is a safety net: it is what makes the script refuse to patch
-an unknown build rather than corrupt it.
-
----
-
-## Caveats
-
-- **Upgrades wipe the patch.** Any Fences update replaces `Fences.exe` and the
-  DLLs. Re-run the script afterwards (and expect to re-derive RVAs).
-- **`License.sig` is untouched.** The 30-day trial signature stays on disk
-  exactly as shipped. The patch makes the program stop consulting it via
-  `Sas.VerifyLicense`. If some component ever called the native
-  `SdAppServices_x64.dll!VerifyActivation` directly, it would still read `Trial`
-  — no such call exists in `Fences.exe` 6.5.8.1.
-- **Backups are per-file.** `*.orig-backup` sits next to each patched file, plus
-  `*.locked-old` (the displaced original during the swap). Both are valid
-  rollback sources.
-- **Not tested on ARM64.** The patch targets the x64/x86 layout. `DesktopDockARM64.dll`
-  is untouched, but the ARM64 build of `Fences.exe` would need its own RVAs.
 
 ---
 
 ## Legal
 
-This repository archives a local reverse-engineering exercise on software the
-author had installed. Fences is a commercial product of Stardock Systems, Inc.;
-no binaries are redistributed here — only patch instructions against files you
-supply yourself. Keep it private and use it on installations you own.
+This repository archives reverse-engineering research on software the author legally installed. Fences is a commercial product of Stardock Systems, Inc. No copyrighted binary files are distributed here — only patch instructions and scripts applied against user-supplied local installations.

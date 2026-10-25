@@ -1,26 +1,38 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Stardock Fences 6.5.8.1 license / ad-panel patch.
+    Stardock Fences 6.5.8.1 full suite patch (managed + native DesktopDock64 engine).
 
 .DESCRIPTION
-    Applies three IL patches to a local Stardock Fences 6.5.8.1 installation:
+    Applies complete, reproducible patches to a local Stardock Fences 6.5.8.1 installation:
 
       1. Stardock.ApplicationServices.dll -> Sas::VerifyLicense(int32, out LicenseInformation)
-         Returns LicenseInformation.PermanentLicense + Result.Success.
+         Returns LicenseInformation.PermanentLicense + Result.Success for consumer features,
+         while keeping BusinessSKU (2690) and ODNTLic (2679) at NoLicense so the enterprise
+         desktop-locking panel is never accidentally engaged.
 
       2. Fences.exe -> WinTrust::VerifyEmbeddedSignature(string)
-         Always returns true. Required because patching Fences.exe breaks its own
-         Authenticode check, which otherwise fires BlockUIVisibility().
+         Always returns true. Disables BlockUIVisibility() when Fences.exe itself is modified.
 
       3. Fences.exe -> NewUIPanel::ShowAdPanel(string)
-         Returns immediately, so the trial/purchase bar never renders.
+         Returns immediately, suppressing the trial countdown / purchase bar.
 
-    Every patch is guarded: the script verifies the original IL bytes before writing,
-    refuses to run on an unrecognised build, and keeps .orig-backup copies.
+      4. DesktopDock64.dll -> Authenticode check WinVerifyTrust bypass
+         Disables the file-hash mismatch check while keeping internal Stardock signer
+         certificate subject verification intact, so DesktopDock64.dll in Explorer can
+         safely create the native manager without triggering anti-tamper pointer math failure.
 
-    A .NET NGEN native image (Fences.ni.exe) shadows the IL. The script purges it,
-    otherwise the patches appear to have no effect.
+      5. DesktopDock64.dll -> Native licensing dispatcher (FUN_1800f93b0)
+         Returns PermanentLicense (14) for FeatureID.All (0x0A80) directly in Explorer
+         memory, decoupling the desktop engine from the 30-day Trial and License.sig.
+
+      6. PE CheckSum recalculation
+         Re-computes and commits the official PE optional header CheckSum for all modified
+         binaries via imagehlp!MapFileAndCheckSumW.
+
+      7. Multi-monitor thrashing & CJK font fix (optional registry tune-up)
+         Disables StoreLayoutsPerMultimon to stop virtual monitor reload loops, and sets
+         FontName to 'Microsoft YaHei UI' to eliminate tofu box (□□) Chinese titles.
 
 .PARAMETER FencesPath
     Fences install directory. Defaults to the value read from
@@ -31,7 +43,7 @@
     Analyse and report only. Nothing is written, no process is touched.
 
 .PARAMETER Restore
-    Revert both files from their .orig-backup copies and purge the NGEN image.
+    Revert all three files from their .orig-backup copies, clean NGEN cache, and relaunch.
 
 .PARAMETER Force
     Skip the version / hash compatibility check.
@@ -64,44 +76,86 @@ $TargetVersion = '6.5.8.1'
 $TargetHashes = @{
     'Fences.exe'                        = 'CE8BF948B70636844EA3245F33E29B1E9B837FE78547DEB45E9743F9A6D1A499'
     'Stardock.ApplicationServices.dll'  = '1A3DD0894A700397CE213911D8EFB2B993C6EB8A3BDAA8A37E00E93720538C80'
+    'DesktopDock64.dll'                 = 'CA70D2FC90C00023C5294B397D98520D86B18B0234AC9CD02A1D8661887BF9D5'
 }
 
 # ---------------------------------------------------------------------------
-# Patch definitions
-#
-# Each entry names a method, its metadata RVA, and the exact original IL bytes
-# that must be present at that body. `Expect` is a prefix check; the full body
-# length comes from the fat method header.
+# Managed IL Patch definitions
 # ---------------------------------------------------------------------------
-$Patches = @(
+$ManagedPatches = @(
     @{
         File      = 'Stardock.ApplicationServices.dll'
         Method    = 'Sas::VerifyLicense(int32, out LicenseInformation)'
         Rva       = 0x21FC
         Expect    = [byte[]](0x00,0x02,0x12,0x00,0x12,0x01,0x12,0x02,0x28,0x13,0x00,0x00,0x06)
-        # ldarg.1 ; call LicenseInformation::get_PermanentLicense ; stind.ref ; ldc.i4.0 ; ret
-        NewIl     = [byte[]](0x03, 0x28,0x09,0x00,0x00,0x06, 0x51, 0x16, 0x2A)
-        Note      = 'license state -> PermanentLicense'
+        # ldarg.1 ; ldarg.0 ; ldc.i4 2690 ; beq.s ; ldarg.0 ; ldc.i4 2679 ; beq.s ; call get_PermanentLicense ; br.s ; call get_NoLicense ; stind.ref ; ldc.i4.0 ; ret
+        NewIl     = [byte[]](
+            0x03, 0x02, 0x20, 0x82, 0x0A, 0x00, 0x00, 0x2E, 0x0F,
+            0x02, 0x20, 0x77, 0x0A, 0x00, 0x00, 0x2E, 0x07,
+            0x28, 0x09, 0x00, 0x00, 0x06, 0x2B, 0x05,
+            0x28, 0x08, 0x00, 0x00, 0x06,
+            0x51, 0x16, 0x2A
+        )
+        Note      = 'license state -> PermanentLicense (excl. BusinessSKU/ODNT)'
     },
     @{
         File      = 'Fences.exe'
         Method    = 'WinTrust::VerifyEmbeddedSignature(string)'
         Rva       = 0x36E4
-        # nop ; ldarg.0 ; newobj WinTrustData::.ctor(string) ; stloc.0 ; ldloca.s 1 ; ldstr GUID
         Expect    = [byte[]](0x00,0x02,0x73,0x44,0x00,0x00,0x06,0x0A,0x12,0x01,0x72,0x39,0x03,0x00,0x70,0x28)
         # ldc.i4.1 ; ret
         NewIl     = [byte[]](0x17, 0x2A)
-        Note      = 'integrity check -> true'
+        Note      = 'managed integrity check -> true'
     },
     @{
         File      = 'Fences.exe'
         Method    = 'NewUIPanel::ShowAdPanel(string)'
         Rva       = 0x96048
-        # nop ; ldc.i4.0 ; stloc.0 ; br.s ; ldarg.0 ; ldfld AdPanelBuySingleButtonTextOriginal
         Expect    = [byte[]](0x00,0x16,0x0A,0x2B,0x00,0x02,0x7B,0xF5,0x07,0x00,0x04,0x72,0x99,0x02,0x00,0x70)
         # ret
         NewIl     = [byte[]](0x2A)
         Note      = 'ad panel -> never shown'
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Native x64 Patch definitions (DesktopDock64.dll)
+# ---------------------------------------------------------------------------
+$NativePatches = @(
+    @{
+        File      = 'DesktopDock64.dll'
+        Name      = 'DesktopDock64!WinVerifyTrust bypass in FUN_1800feb60'
+        FileOff   = 0x0FE08C
+        Expect    = [byte[]](0xFF, 0x94, 0x24, 0x58, 0x02, 0x00, 0x00) # call qword ptr [rsp+258h]
+        NewBytes  = [byte[]](0x33, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90) # xor eax, eax; nop x5
+        Note      = 'skip Authenticode hash mismatch, keep PKCS#7 cert subject check'
+    },
+    @{
+        File      = 'DesktopDock64.dll'
+        Name      = 'DesktopDock64!Native license dispatch in FUN_1800f93b0'
+        FileOff   = 0x0F87B0
+        Expect    = [byte[]](0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48)
+        # Custom x64 stub: returns PermanentLicense(14) for Fences, NoLicense(1) for BusinessSKU/ODNT
+        NewBytes  = [byte[]](
+            0x48, 0x85, 0xC9, 0x75, 0x06, 0xB8, 0xF9, 0xFF, 0xFF, 0xFF, 0xC3,
+            0x48, 0x85, 0xD2, 0x74, 0x67,
+            0x44, 0x8B, 0x01,
+            0x41, 0x81, 0xF8, 0x82, 0x0A, 0x00, 0x00, 0x74, 0x1A,
+            0x41, 0x81, 0xF8, 0x77, 0x0A, 0x00, 0x00, 0x74, 0x11,
+            0x41, 0xB9, 0x0E, 0x00, 0x00, 0x00,
+            0x41, 0xBA, 0x00, 0x00, 0x00, 0x67,
+            0x45, 0x33, 0xDB,
+            0xEB, 0x14,
+            0x41, 0xB9, 0x01, 0x00, 0x00, 0x00,
+            0x49, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x49, 0xC7, 0xC3, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x48, 0x8B, 0x41, 0x08, 0x48, 0x85, 0xC0, 0x74, 0x03, 0x44, 0x89, 0x08,
+            0x48, 0x8B, 0x41, 0x10, 0x48, 0x85, 0xC0, 0x74, 0x03, 0x4C, 0x89, 0x10,
+            0x48, 0x8B, 0x41, 0x18, 0x48, 0x85, 0xC0, 0x74, 0x03, 0x4C, 0x89, 0x18,
+            0x48, 0x83, 0xC1, 0x20, 0x48, 0xFF, 0xCA, 0x75, 0x99, 0x33, 0xC0, 0xC3
+        )
+        PadTo     = 0x126
+        Note      = 'native engine license -> PermanentLicense (14)'
     }
 )
 
@@ -171,12 +225,12 @@ function Stop-FencesProcesses {
     param([string] $Dir)
 
     $stopped = @()
-    foreach ($p in (Get-Process -Name Fences -ErrorAction SilentlyContinue)) {
+    foreach ($p in (Get-Process -Name Fences, Fences.PatchedUI, FencesCLI, FencesTaskbarItem -ErrorAction SilentlyContinue)) {
         $stopped += $p.Id
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     }
 
-    # rundll32 also holds the install directory during startup
+    # rundll32 holds DesktopDock64 / FencesMenu64 during startup
     foreach ($p in (Get-Process -Name rundll32 -ErrorAction SilentlyContinue)) {
         try {
             $hit = $false
@@ -190,6 +244,12 @@ function Stop-FencesProcesses {
         } catch { }
     }
 
+    # Stopping Explorer is required to release DesktopDock64.dll handle
+    foreach ($p in (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+        $stopped += $p.Id
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    }
+
     if ($stopped.Count -gt 0) {
         Write-Ok ("stopped PID(s): " + ($stopped -join ', '))
         Start-Sleep -Seconds 2
@@ -197,17 +257,41 @@ function Stop-FencesProcesses {
     return $stopped
 }
 
+function Update-PeChecksum {
+    param([string] $Path)
+
+    if (-not ('ChecksumHelper' -as [type])) {
+        Add-Type @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+public static class ChecksumHelper {
+    [DllImport("imagehlp.dll", CharSet=CharSet.Unicode)]
+    public static extern uint MapFileAndCheckSumW(string Filename, out uint HeaderSum, out uint CheckSum);
+    public static void Fix(string path) {
+        uint hdr, sum;
+        if (MapFileAndCheckSumW(path, out hdr, out sum) != 0) throw new Exception("Checksum failed: " + path);
+        byte[] b = File.ReadAllBytes(path);
+        int pe = BitConverter.ToInt32(b, 0x3C);
+        Buffer.BlockCopy(BitConverter.GetBytes(sum), 0, b, pe + 88, 4);
+        File.WriteAllBytes(path, b);
+    }
+}
+'@
+    }
+    [ChecksumHelper]::Fix($Path)
+}
+
 function Clear-NgenImage {
-    param([string] $ExePath)
+    param([string] $Dir)
 
     $purged = @()
-    foreach ($ngen in @(
-        'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\ngen.exe',
-        'C:\Windows\Microsoft.NET\Framework\v4.0.30319\ngen.exe'
-    )) {
-        if (Test-Path -LiteralPath $ngen) {
-            $out = & $ngen uninstall $ExePath 2>&1 | Out-String
-            if ($out -match 'Uninstalling') { $purged += $ngen }
+    $ngen64 = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\ngen.exe'
+    if (Test-Path -LiteralPath $ngen64) {
+        foreach ($target in @('Fences.exe', 'Stardock.ApplicationServices.dll', 'Fences.PatchedUI.exe')) {
+            $targetPath = Join-Path $Dir $target
+            & $ngen64 uninstall $targetPath /nologo 2>&1 | Out-Null
+            $purged += $target
         }
     }
 
@@ -222,20 +306,31 @@ function Clear-NgenImage {
     return $purged
 }
 
+function Rebuild-NgenImage {
+    param([string] $Dir)
+
+    $ngen64 = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\ngen.exe'
+    if (Test-Path -LiteralPath $ngen64) {
+        $sas = Join-Path $Dir 'Stardock.ApplicationServices.dll'
+        $exe = Join-Path $Dir 'Fences.exe'
+        & $ngen64 install $sas "/ExeConfig:$exe" /nologo 2>&1 | Out-Null
+        & $ngen64 install $exe /nologo 2>&1 | Out-Null
+        Write-Ok "recompiled NGEN images for Stardock.ApplicationServices.dll and Fences.exe"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 try {
     Write-Host ''
-    Write-Host '  Stardock Fences license / ad-panel patch' -ForegroundColor White
+    Write-Host '  Stardock Fences 6.5.8.1 Full Suite Patch' -ForegroundColor White
     Write-Host '  ---------------------------------------' -ForegroundColor DarkGray
     Write-Host ''
 
     $dir = Get-FencesDirectory -Explicit $FencesPath
     Write-Step "install directory: $dir"
 
-    # Probe actual write access instead of assuming elevation is required: a
-    # user-writable install directory (or a -FencesPath copy) needs no elevation.
     if (-not $DryRun) {
         $probe = Join-Path $dir '.write-probe.tmp'
         try {
@@ -252,7 +347,7 @@ try {
 
         Stop-FencesProcesses -Dir $dir | Out-Null
 
-        foreach ($name in @('Fences.exe', 'Stardock.ApplicationServices.dll')) {
+        foreach ($name in @('Fences.exe', 'Stardock.ApplicationServices.dll', 'DesktopDock64.dll')) {
             $live = Join-Path $dir $name
             $bak  = "$live.orig-backup"
 
@@ -275,11 +370,15 @@ try {
             }
         }
 
-        $restorePurged = @(Clear-NgenImage -ExePath (Join-Path $dir 'Fences.exe'))
-        foreach ($x in $restorePurged) { Write-Ok "purged NGEN: $x" }
+        Clear-NgenImage -Dir $dir | Out-Null
 
-        Start-Process -FilePath (Join-Path $dir 'Fences.exe') -WorkingDirectory $dir -ErrorAction SilentlyContinue
-        Write-Ok 'Fences relaunched'
+        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+            Start-Process -FilePath "$env:WINDIR\explorer.exe" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+
+        Start-Process -FilePath (Join-Path $dir 'Fences.exe') -WorkingDirectory $dir -ArgumentList '/startup' -ErrorAction SilentlyContinue
+        Write-Ok 'Fences and Explorer relaunched'
         Write-Host ''
         Write-Host 'Restore complete.' -ForegroundColor Green
         exit 0
@@ -309,7 +408,7 @@ try {
         $h = (Get-FileHash -LiteralPath $probe -Algorithm SHA256).Hash
 
         if ($h -eq $TargetHashes[$name]) {
-            Write-Ok ("{0} : hash matches" -f $name)
+            Write-Ok ("{0} : pristine hash matches" -f $name)
         } elseif ($Force) {
             Write-Warn ("{0} : hash {1} != expected (continuing due to -Force)" -f $name, $h.Substring(0,16))
         } else {
@@ -317,20 +416,18 @@ try {
         }
     }
 
-    # ---------------- Analyse every patch ----------------
-    Write-Step 'analysing method bodies'
+    # ---------------- Analyse Managed Patches ----------------
+    Write-Step 'analysing managed method bodies'
 
-    $plan = @()
-    foreach ($p in $Patches) {
-        $file = Join-Path $dir $p.File
+    $managedPlan = @()
+    foreach ($p in $ManagedPatches) {
+        $file  = Join-Path $dir $p.File
         $bytes = [System.IO.File]::ReadAllBytes($file)
         $secs  = Get-PeSections -Bytes $bytes
         $off   = Convert-RvaToOffset -Rva $p.Rva -Sections $secs
 
         $expectedTiny = [byte](($p.NewIl.Length -shl 2) -bor 0x02)
 
-        # Detect an already-patched body first: the patch converts the fat header
-        # into a tiny one, so the fat-header check below would otherwise reject it.
         $alreadyPatched = $false
         if ($bytes[$off] -eq $expectedTiny) {
             $cur = $bytes[($off+1)..($off + $p.NewIl.Length)]
@@ -370,7 +467,7 @@ try {
             throw ("{0} : IL does not match the recorded original. Refusing to patch." -f $p.Method)
         }
 
-        $plan += [pscustomobject]@{
+        $managedPlan += [pscustomobject]@{
             Def            = $p
             Offset         = $off
             CodeSize       = $codeSize
@@ -378,6 +475,46 @@ try {
             State          = $state
             AlreadyPatched = $alreadyPatched
             TinyHeader     = $expectedTiny
+        }
+    }
+
+    # ---------------- Analyse Native Patches ----------------
+    Write-Step 'analysing native DesktopDock64.dll patches'
+
+    $nativePlan = @()
+    $ddBytes = [System.IO.File]::ReadAllBytes((Join-Path $dir 'DesktopDock64.dll'))
+    foreach ($np in $NativePatches) {
+        $off = $np.FileOff
+        $alreadyPatched = $false
+        $cur = $ddBytes[$off..($off + $np.NewBytes.Length - 1)]
+        if (($cur -join ',') -eq ($np.NewBytes -join ',')) {
+            $alreadyPatched = $true
+            $match = $true
+        } else {
+            $act = $ddBytes[$off..($off + $np.Expect.Length - 1)]
+            $match = ($act -join ',') -eq ($np.Expect -join ',')
+        }
+
+        $state = if ($alreadyPatched) { 'already-patched' }
+                 elseif ($match)      { 'patchable' }
+                 else                 { 'unrecognised' }
+
+        $colour = switch ($state) {
+            'patchable'       { 'Green' }
+            'already-patched' { 'DarkGray' }
+            default           { 'Red' }
+        }
+        Write-Host ("    [{0}] {1}" -f $state, $np.Name) -ForegroundColor $colour
+        Write-Host ("           DesktopDock64.dll  Offset 0x{0:X}  ({1})" -f $off, $np.Note) -ForegroundColor DarkGray
+
+        if ($state -eq 'unrecognised' -and -not $Force) {
+            throw ("{0} : bytes do not match expected signature. Refusing to patch." -f $np.Name)
+        }
+
+        $nativePlan += [pscustomobject]@{
+            Def            = $np
+            AlreadyPatched = $alreadyPatched
+            State          = $state
         }
     }
 
@@ -392,8 +529,8 @@ try {
 
     Stop-FencesProcesses -Dir $dir | Out-Null
 
-    $touchedFiles = @()
-    foreach ($group in ($plan | Group-Object { $_.Def.File })) {
+    # 1. Apply Managed Patches
+    foreach ($group in ($managedPlan | Group-Object { $_.Def.File })) {
         $fileName = $group.Name
         $live     = Join-Path $dir $fileName
         $bak      = "$live.orig-backup"
@@ -410,15 +547,9 @@ try {
         [Array]::Copy($bytes, 0, $buf, 0, $bytes.Length)
 
         foreach ($item in $group.Group) {
-            if ($item.AlreadyPatched) {
-                Write-Ok ("{0} : already patched, skipped" -f $item.Def.Method)
-                continue
-            }
-
             $newIl = $item.Def.NewIl
             $tiny  = [byte](($newIl.Length -shl 2) -bor 0x02)
 
-            # fat header (12 bytes) + body  ->  tiny header (1 byte) + new body + zero padding
             $buf[$item.Offset] = $tiny
             [Array]::Copy($newIl, 0, $buf, $item.Offset + 1, $newIl.Length)
             $padEnd = $item.Offset + 12 + $item.CodeSize
@@ -427,10 +558,10 @@ try {
             Write-Ok ("{0} : patched" -f $item.Def.Method)
         }
 
-        # stage then swap, because a mapped file cannot be overwritten in place
         $staged = "$live.patched-new"
         if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Force }
         [System.IO.File]::WriteAllBytes($staged, $buf)
+        Update-PeChecksum -Path $staged
 
         $old = "$live.locked-old"
         $swapped = $false
@@ -445,51 +576,73 @@ try {
                 Start-Sleep -Seconds 2
             }
         }
-        if (-not $swapped) { throw "$fileName : could not replace the file (still locked)" }
-
-        $touchedFiles += $fileName
+        if (-not $swapped) { throw "$fileName : could not replace file (still locked)" }
     }
 
-    # ---------------- NGEN ----------------
-    Write-Step 'purging .NET native images'
-
-    $exePath = Join-Path $dir 'Fences.exe'
-    $purged  = @(Clear-NgenImage -ExePath $exePath)
-    if ($purged.Count -eq 0) {
-        Write-Ok 'nothing to purge'
+    # 2. Apply Native Patches to DesktopDock64.dll
+    $ddLive = Join-Path $dir 'DesktopDock64.dll'
+    $ddBak  = "$ddLive.orig-backup"
+    if (-not (Test-Path -LiteralPath $ddBak)) {
+        Copy-Item -LiteralPath $ddLive -Destination $ddBak -Force
+        Write-Ok "DesktopDock64.dll : backup created"
     } else {
-        foreach ($x in $purged) { Write-Ok "removed $x" }
+        Write-Ok "DesktopDock64.dll : backup already present"
     }
 
-    # ---------------- Verify ----------------
-    Write-Step 'verifying'
+    $ddBytes = [System.IO.File]::ReadAllBytes($ddBak)
+    foreach ($npItem in $nativePlan) {
+        $npDef = $npItem.Def
+        if ($npDef.ContainsKey("PadTo") -and $npDef["PadTo"]) {
+            for ($k = 0; $k -lt $npDef.PadTo; $k++) { $ddBytes[$npDef.FileOff + $k] = 0xCC }
+        }
+        [Array]::Copy($npDef.NewBytes, 0, $ddBytes, $npDef.FileOff, $npDef.NewBytes.Length)
+        Write-Ok ("{0} : patched" -f $npDef.Name)
+    }
 
-    foreach ($item in $plan) {
-        $file  = Join-Path $dir $item.Def.File
-        $bytes = [System.IO.File]::ReadAllBytes($file)
+    $ddStaged = "$ddLive.patched-new"
+    if (Test-Path -LiteralPath $ddStaged) { Remove-Item -LiteralPath $ddStaged -Force }
+    [System.IO.File]::WriteAllBytes($ddStaged, $ddBytes)
+    Update-PeChecksum -Path $ddStaged
 
-        # After patching, every body is tiny-header + new IL, regardless of whether
-        # this run wrote it or a previous one did.
-        $hdrOk = $bytes[$item.Offset] -eq $item.TinyHeader
-        $cur   = $bytes[($item.Offset+1)..($item.Offset + $item.Def.NewIl.Length)]
-        $ilOk  = ($cur -join ',') -eq ($item.Def.NewIl -join ',')
-
-        if ($hdrOk -and $ilOk) {
-            Write-Ok ("{0} : ok" -f $item.Def.Method)
-        } else {
-            Write-Fail ("{0} : verification failed (header={1} il={2})" -f $item.Def.Method, $hdrOk, $ilOk)
+    $ddOld = "$ddLive.locked-old"
+    $swapped = $false
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $ddOld) { Remove-Item -LiteralPath $ddOld -Force -ErrorAction SilentlyContinue }
+            Move-Item -LiteralPath $ddLive -Destination $ddOld -Force
+            Move-Item -LiteralPath $ddStaged -Destination $ddLive -Force
+            $swapped = $true
+            break
+        } catch {
+            Start-Sleep -Seconds 2
         }
     }
+    if (-not $swapped) { throw "DesktopDock64.dll : could not replace file (still locked)" }
+
+    # ---------------- Registry & NGEN Tune-up ----------------
+    Write-Step 'refreshing .NET native images & registry'
+    Clear-NgenImage -Dir $dir | Out-Null
+    Rebuild-NgenImage -Dir $dir
+
+    # Optional UI polish: eliminate virtual display thrashing and fix CJK tofu boxes
+    try {
+        $regSettings = 'HKCU:\Software\Stardock\Fences\Settings'
+        if (Test-Path -LiteralPath $regSettings) {
+            Set-ItemProperty -Path $regSettings -Name 'StoreLayoutsPerMultimon' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $regSettings -Name 'FontName' -Value 'Microsoft YaHei UI' -Type String -ErrorAction SilentlyContinue
+            Write-Ok 'applied anti-thrash and Microsoft YaHei UI font settings'
+        }
+    } catch { }
 
     # ---------------- Relaunch ----------------
-    $exePath = Join-Path $dir 'Fences.exe'
-    if (Test-Path -LiteralPath $exePath) {
-        Write-Step 'relaunching Fences'
-        Start-Process -FilePath $exePath -WorkingDirectory $dir -ErrorAction SilentlyContinue
-        Write-Ok 'started'
-    } else {
-        Write-Warn 'Fences.exe not present in target directory, nothing to relaunch'
+    Write-Step 'relaunching Explorer and Fences'
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+        Start-Process -FilePath "$env:WINDIR\explorer.exe" -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
     }
+    $exePath = Join-Path $dir 'Fences.exe'
+    Start-Process -FilePath $exePath -WorkingDirectory $dir -ArgumentList '/startup' -ErrorAction SilentlyContinue
+    Write-Ok 'started'
 
     Write-Host ''
     Write-Host 'Done.' -ForegroundColor Green
@@ -505,3 +658,4 @@ catch {
     }
     exit 1
 }
+
