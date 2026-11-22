@@ -101,7 +101,7 @@ cmp     r8d, 0A82h                      ; FeatureID.BusinessSKU
 je      loc_nolic
 cmp     r8d, 0A77h                      ; FeatureID.ODNTLic
 je      loc_nolic
-mov     r9d, 14                         ; LicenseState.PermanentLicense
+mov     r9d, 0Dh                        ; LicenseState.Subscription
 mov     r10d, 67000000h                 ; Activation timestamp dummy
 xor     r11d, r11d                      ; Expiration timestamp (never)
 jmp     loc_store
@@ -133,6 +133,49 @@ xor     eax, eax
 ret
 ```
 
+> **Why 13 and not 14.** The managed tier reports `Subscription (13)`, so the native
+> dispatcher must agree. Writing `14` here leaves `Features.GetIsSubscription()` false
+> in the UI while the desktop engine believes it holds a permanent licence — the two
+> tiers describing different products. Scanning the whole `.text` section for
+> comparisons against `0x0E` turns up three sites (`rva 0xCE94B`, `0xD5E2F`, `0xF7993`),
+> all of which are jump-table index bounds (`movdqu` + range check), not license-state
+> tests, so no code depends on the value being exactly 14.
+
+---
+
+## Patch 6 — `Stardock.ApplicationServices.dll!LicenseInformation::get_PermanentLicense`
+
+- **RVA:** `0x000020E4` → **File Offset:** `0x000002E4`, fat header 12 bytes, body at `0x000002F0`
+- **IL offset `0x0E`** holds `1F <state>` (`ldc.i4.s <state>`); the operand sits at **file offset `0x000002FF`**.
+
+| | Bytes at `0x2FE` | Meaning |
+|---|---|---|
+| Original | `1F 0E 7E 21 00 00 0A` | `ldc.i4.s 14` — `LicenseState.PermanentLicense` |
+| Patched  | `1F 0D 7E 21 00 00 0A` | `ldc.i4.s 13` — `LicenseState.Subscription` |
+
+Single-byte operand rewrite. The fat header, declared code size (47) and local
+signature stay byte-identical to the shipped build, unlike the tiny-header rewrites in
+patches 1–3.
+
+**Why this is the right place to change the SKU.** `Sas::VerifyLicense` returns the
+`LicenseInformation.PermanentLicense` singleton, and that singleton's `State` is
+whatever this getter constructs. Patching the operand makes **every** consumer see
+`Subscription` at once, including `Features.GetIsSubscription()`, which is what drives
+the *Manage subscription* entry in the About panel. Patching `Sas::VerifyLicense`
+instead would need a brand new `LicenseInformation` allocation and cannot reuse the
+singleton, so the getter is both smaller and more faithful.
+
+---
+
+## Registry / side effects
+
+`InstallationLog.CheckLicenseStateChanged()` compares the live state against
+`HKCU\Software\Stardock\Fences\AppLicenseState` and
+`%ProgramData%\Stardock\Fences6\LastLicenseState.dat`. Both are rewritten with `13`
+on the first run after patching. If you ever revert to an unpatched build, reset both
+to `0` first, otherwise the "state changed" branch fires a spurious
+`AppSubscriptionConvertedToPurchase` telemetry event.
+
 ---
 
 ## Resulting Binary Hashes
@@ -147,6 +190,10 @@ DesktopDock64.dll                 CA70D2FC90C00023C5294B397D98520D86B18B0234AC9C
 ### Patched:
 ```
 Fences.exe                        E9DFF6354E903B59AD7AE1C6B9FB10A2FF4CD302564B00809ABCBFC0D26C7E13
-Stardock.ApplicationServices.dll  175A8AF77D3D69A39BEA989F77DB629351E440B96681728DAF2E5FE5BED36030
-DesktopDock64.dll                 2D936968BEED21465C63FF6F5AD66B55C1261679575C8241EEF0E8CCF704B433
+Stardock.ApplicationServices.dll  D2EE6AFEBD36A4733C26BFBB01961B4424AAFFE60469F7F27B3BFF081A188E67
+DesktopDock64.dll                 6DAB1B999FEC1E8BD903A81B354C2CC51DB94E17389C7C746057122322FE0E21
 ```
+
+> Superseded values, kept for cross-referencing older archives: the pre-Subscription
+> `Stardock.ApplicationServices.dll` was `175A8AF7…` (state 14) and the pre-Subscription
+> `DesktopDock64.dll` was `2D936968…` (native `mov r9d, 0Eh`).
