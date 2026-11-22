@@ -106,6 +106,43 @@ public enum LicenseState
 it. That is the actual mechanism behind "trial limits features" — not a
 countdown.
 
+### 13 vs 14
+
+Both `Subscription = 13` and `PermanentLicense = 14` clear the gate. The
+difference is what the product claims to be:
+
+```csharp
+// Features.cs
+public static bool GetIsSubscription(FeatureID Feature) =>
+    FeatureInfo[Feature].State == LicenseState.Subscription;      // 13 only
+```
+
+That single predicate drives `About1UPAndStardock.ManageSubscriptionBtn.Visible`,
+so a `PermanentLicense` build presents itself as a perpetual purchase and offers
+no subscription management at all. The patch set therefore lands on **13**.
+
+`Sas::VerifyLicense` hands back the `LicenseInformation.PermanentLicense`
+singleton, and that singleton's `State` is the immediate inside
+`get_PermanentLicense`. One operand byte there reaches every consumer at once:
+
+```
+IL_0016:  1F 0E  ->  1F 0D
+          ldc.i4.s 14   ldc.i4.s 13
+```
+
+Rewriting `Sas::VerifyLicense` instead would mean allocating a fresh
+`LicenseInformation` — more bytes, more risk, and it still would not fix the
+singleton that other call paths read.
+
+### A per-SKU caveat in the feature table
+
+`Purchased_Real[f]` is `IsActivated_Purchased(All) || IsActivated_Purchased(f)`,
+and `Feature_State[f]` short-circuits to `GetState(All)` whenever that is not
+`NoLicense`. Once `All` is unlocked, **both indexers report success for every id**
+— including `BusinessSKU` and `ODNTLic`. Neither is a per-SKU probe. To confirm
+the enterprise gates are still held at `NoLicense`, call `Sas.VerifyLicense`
+with 2690 / 2679 directly (`docs/verify.ps1` does exactly that).
+
 ## Where the countdown lives
 
 ```csharp
@@ -151,21 +188,77 @@ if (!CheckSign.Verified) {
 
 ```
 C:\Windows\assembly\NativeImages_v4.0.30319_64\Fences\Fences.ni.exe   17 937 920 bytes
+C:\Windows\assembly\NativeImages_v4.0.30319_64\Stardock.Ap2ec9f628#\...\Stardock.ApplicationServices.ni.dll
+                                                                        242 176 bytes
 ```
 
 Created at install time. The CLR binds to the native image, so IL edits appear
 to have no effect — the log keeps showing `INTEGRITY COMPROMISED` from the
 cached machine code.
 
-`ngen.exe uninstall <exe>` plus deleting the `Fences` image directory restores
-IL-only execution, after which the patches take effect.
+Empirically, three separate things defeat the obvious cleanup:
+
+1. `ngen.exe uninstall <assembly>` exits 0 and prints `Uninstalling assembly …`
+   while leaving the `.ni.dll` exactly where it was.
+2. `takeown` + `icacls /grant` succeed and still produce *Access denied* on
+   `del` — the image is mapped into a live process, and mapped files cannot be
+   deleted regardless of ACL.
+3. The cache directory is owned by whoever last ran NGen (here `PPOPIOS\viper`),
+   not `TrustedInstaller`, so no ownership escalation is needed at all.
+
+The working sequence is: stop Fences, delete the `.ni.dll`, then start Fences
+again. Confirmed by reflection — with the image present, `get_PermanentLicense`
+reported `IL len=47 byte14=0x0E`; after deleting it, `byte14=0x0D` and
+`State = Subscription`.
+
+## The native tier also carries licence logic
+
+`DesktopDock64.dll` is not purely a rendering engine. `FUN_1800f93b0`
+(`RVA 0x000F93B0`) is a dispatcher that walks an array of activation requests and
+writes the licence state straight into each entry:
+
+```asm
+cmp     r8d, 0A82h        ; FeatureID.BusinessSKU
+je      loc_nolic
+cmp     r8d, 0A77h        ; FeatureID.ODNTLic
+je      loc_nolic
+mov     r9d, 0Eh          ; LicenseState  (stock: PermanentLicense)
+```
+
+It has exactly two direct callers (`rva 0x1DBB96`, `0x1DBC32`), both in the
+Explorer-side initialisation path. Because the desktop fence manager runs inside
+`explorer.exe`, this tier must be patched to the same value as the managed tier —
+otherwise the shell believes it holds a perpetual licence while the settings UI
+reports a subscription.
+
+Scanning all of `.text` for comparisons against `0x0E` finds three sites
+(`rva 0xCE94B`, `0xD5E2F`, `0xF7993`). All three are jump-table index bounds
+(`movdqu` + range check), not licence tests, so changing `0Eh` to `0Dh` in the
+dispatcher has no knock-on effect.
+
+## Files that hold the binaries open
+
+Replacing these files failed repeatedly with no useful message until Restart
+Manager (`RmGetList`) was used to ask who actually had them open:
+
+| Binary | Holder |
+|---|---|
+| `Stardock.ApplicationServices.dll` | `rundll32.exe "…\FencesMenu64.dll",StartFences` |
+| `DesktopDock64.dll` | `explorer.exe` (the shell itself) |
+
+Neither is `Fences.exe`. The `rundll32` host is a long-lived stub started at
+login; the DLL only frees once it exits. `DesktopDock64.dll` cannot be replaced
+while Explorer is running, which is why `Patch-Fences.ps1` gained
+`-RestartExplorer` and a `*.pending-apply` fallback.
 
 ## Tools used
 
-- ILSpy (`ilspycmd`) for IL and C# decompilation
+- ILSpy (`ilspycmd` 9.1) for IL and C# decompilation
+- `objdump` (binutils, mingw64) for the x64 disassembly above
 - `System.Reflection` (via PowerShell) to invoke patched methods and read back
   `LicenseState`, `Feature_State`, `Purchased_Real`
 - Win32 `EnumChildWindows` / `GetWindowText` plus screen capture to confirm the
   ad panel actually disappeared from the UI
-- Restart Manager (`RmGetList`) to identify the process holding the files —
-  it turned out to be a long-lived `rundll32.exe`, not just `Fences.exe`
+- Restart Manager (`RmGetList`) to identify the processes holding the files
+- Byte-level differ (`hashlib` + section walker) to prove a given file differs
+  from its `.orig-backup` by exactly N bytes, and where

@@ -48,6 +48,12 @@
 .PARAMETER Force
     Skip the version / hash compatibility check.
 
+.PARAMETER RestartExplorer
+    DesktopDock64.dll runs inside explorer.exe and is locked while the shell is alive.
+    With this switch the script restarts Explorer so the native image can be swapped in
+    immediately. All open Explorer windows close. Without it the patched native image is
+    left staged as DesktopDock64.dll.pending-apply for a later run.
+
 .EXAMPLE
     .\Patch-Fences.ps1 -DryRun
 
@@ -62,7 +68,8 @@ param(
     [string] $FencesPath,
     [switch] $DryRun,
     [switch] $Restore,
-    [switch] $Force
+    [switch] $Force,
+    [switch] $RestartExplorer
 )
 
 Set-StrictMode -Version Latest
@@ -96,7 +103,7 @@ $ManagedPatches = @(
             0x28, 0x08, 0x00, 0x00, 0x06,
             0x51, 0x16, 0x2A
         )
-        Note      = 'license state -> PermanentLicense (excl. BusinessSKU/ODNT)'
+        Note      = 'license state -> Subscription singleton (excl. BusinessSKU/ODNT)'
     },
     @{
         File      = 'Fences.exe'
@@ -115,6 +122,25 @@ $ManagedPatches = @(
         # ret
         NewIl     = [byte[]](0x2A)
         Note      = 'ad panel -> never shown'
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Single-byte constant patches (keep the original fat method header intact)
+# ---------------------------------------------------------------------------
+# These are surgical operand rewrites. Unlike $ManagedPatches above, the method
+# body is NOT rewritten: only one immediate byte changes, so the fat header,
+# code size and local signature all stay exactly as shipped.
+$BytePatches = @(
+    @{
+        File    = 'Stardock.ApplicationServices.dll'
+        Name    = 'LicenseInformation::get_PermanentLicense -> Subscription'
+        FileOff = 0x2FF          # RVA 0x20E4 + 12-byte fat header + IL offset 0x0F
+        Expect  = [byte]0x0E     # ldc.i4.s 14 (PermanentLicense)
+        NewByte = [byte]0x0D     # ldc.i4.s 13 (Subscription)
+        Guard   = [byte[]](0x1F, 0x0E, 0x7E, 0x21, 0x00, 0x00, 0x0A)   # 1F <state> 7E 21 00 00 0A @ 0x2FE
+        GuardAt = 0x2FE
+        Note    = 'the singleton every feature gate reads; 14 -> 13 makes GetIsSubscription() true'
     }
 )
 
@@ -142,7 +168,7 @@ $NativePatches = @(
             0x44, 0x8B, 0x01,
             0x41, 0x81, 0xF8, 0x82, 0x0A, 0x00, 0x00, 0x74, 0x1A,
             0x41, 0x81, 0xF8, 0x77, 0x0A, 0x00, 0x00, 0x74, 0x11,
-            0x41, 0xB9, 0x0E, 0x00, 0x00, 0x00,
+            0x41, 0xB9, 0x0D, 0x00, 0x00, 0x00,   # mov r9d, 0x0D = Subscription (13)
             0x41, 0xBA, 0x00, 0x00, 0x00, 0x67,
             0x45, 0x33, 0xDB,
             0xEB, 0x14,
@@ -155,7 +181,7 @@ $NativePatches = @(
             0x48, 0x83, 0xC1, 0x20, 0x48, 0xFF, 0xCA, 0x75, 0x99, 0x33, 0xC0, 0xC3
         )
         PadTo     = 0x126
-        Note      = 'native engine license -> PermanentLicense (14)'
+        Note      = 'native engine license -> Subscription (13), matching the managed tier'
     }
 )
 
@@ -428,10 +454,24 @@ try {
 
         $expectedTiny = [byte](($p.NewIl.Length -shl 2) -bor 0x02)
 
+        # A previous run may already have rewritten this body. Treat a live file that
+        # carries our output as legal input, and always patch from the pristine backup
+        # so repeated runs stay idempotent instead of stacking edits.
         $alreadyPatched = $false
         if ($bytes[$off] -eq $expectedTiny) {
             $cur = $bytes[($off+1)..($off + $p.NewIl.Length)]
             $alreadyPatched = ($cur -join ',') -eq ($p.NewIl -join ',')
+        }
+        if (-not $alreadyPatched) {
+            $bakPath = "$file.orig-backup"
+            if (Test-Path -LiteralPath $bakPath) {
+                $bakBytes = [System.IO.File]::ReadAllBytes($bakPath)
+                $bakOff   = Convert-RvaToOffset -Rva $p.Rva -Sections (Get-PeSections -Bytes $bakBytes)
+                if ($bakBytes[$bakOff] -eq $expectedTiny) {
+                    $bakCur = $bakBytes[($bakOff+1)..($bakOff + $p.NewIl.Length)]
+                    if (($bakCur -join ',') -eq ($p.NewIl -join ',')) { $alreadyPatched = $true }
+                }
+            }
         }
 
         if ($alreadyPatched) {
@@ -476,6 +516,40 @@ try {
             AlreadyPatched = $alreadyPatched
             TinyHeader     = $expectedTiny
         }
+    }
+
+    # ---------------- Analyse Single-Byte Constant Patches ----------------
+    Write-Step 'analysing single-byte constant patches'
+
+    $bytePlan = @()
+    foreach ($bp in $BytePatches) {
+        $file  = Join-Path $dir $bp.File
+        $bytes = [System.IO.File]::ReadAllBytes($file)
+        $cur   = $bytes[$bp.FileOff]
+
+        $guardOk = $true
+        for ($k = 0; $k -lt $bp.Guard.Length; $k++) {
+            if ($bytes[$bp.GuardAt + $k] -ne $bp.Guard[$k]) { $guardOk = $false; break }
+        }
+
+        $state = if ($cur -eq $bp.NewByte) { 'already-patched' }
+                 elseif ($cur -eq $bp.Expect -and $guardOk) { 'patchable' }
+                 else { 'unrecognised' }
+
+        $colour = switch ($state) {
+            'patchable'       { 'Green' }
+            'already-patched' { 'DarkGray' }
+            default           { 'Red' }
+        }
+        Write-Host ("    [{0}] {1}" -f $state, $bp.Name) -ForegroundColor $colour
+        Write-Host ("           {0}  file+0x{1:X}  0x{2:X2} -> 0x{3:X2}  ({4})" -f `
+            $bp.File, $bp.FileOff, $cur, $bp.NewByte, $bp.Note) -ForegroundColor DarkGray
+
+        if ($state -eq 'unrecognised' -and -not $Force) {
+            throw ("{0} : byte 0x{1:X2} at file+0x{2:X} does not match the recorded original, or the surrounding guard bytes changed. Refusing to patch." -f $bp.Name, $cur, $bp.FileOff)
+        }
+
+        $bytePlan += [pscustomobject]@{ Def = $bp; State = $state }
     }
 
     # ---------------- Analyse Native Patches ----------------
@@ -558,6 +632,14 @@ try {
             Write-Ok ("{0} : patched" -f $item.Def.Method)
         }
 
+        # Merge in any single-byte constant patches that target the same file,
+        # so the file is written once and neither kind of edit clobbers the other.
+        foreach ($bpItem in ($bytePlan | Where-Object { $_.Def.File -eq $fileName -and $_.State -ne 'already-patched' })) {
+            $bp = $bpItem.Def
+            $buf[$bp.FileOff] = $bp.NewByte
+            Write-Ok ("{0} : patched (0x{1:X2} -> 0x{2:X2})" -f $bp.Name, $bp.Expect, $bp.NewByte)
+        }
+
         $staged = "$live.patched-new"
         if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Force }
         [System.IO.File]::WriteAllBytes($staged, $buf)
@@ -617,7 +699,48 @@ try {
             Start-Sleep -Seconds 2
         }
     }
-    if (-not $swapped) { throw "DesktopDock64.dll : could not replace file (still locked)" }
+
+    if (-not $swapped) {
+        # DesktopDock64.dll is normally held open by explorer.exe, because the native
+        # fence engine runs inside the shell process. Renewing the desktop is the only
+        # way to free it; -RestartExplorer opts into that. Otherwise leave the built
+        # image staged so it can be swapped in at the next opportunity.
+        $pending = Join-Path $dir 'DesktopDock64.dll.pending-apply'
+        if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue }
+        Move-Item -LiteralPath $ddStaged -Destination $pending -Force
+        Write-Warn 'DesktopDock64.dll is locked by explorer.exe'
+
+        if (-not $RestartExplorer) {
+            Write-Warn ("staged native image at {0}" -f $pending)
+            Write-Warn 'run with -RestartExplorer to restart the shell and apply it now (open windows will close)'
+        } else {
+            Write-Step 'restarting explorer to release DesktopDock64.dll'
+            $shell = Get-Process -Name explorer -ErrorAction SilentlyContinue
+            foreach ($s in $shell) { try { $s.CloseMainWindow() | Out-Null } catch { } }
+            Start-Sleep -Seconds 2
+            foreach ($s in (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+                try { $s.Kill() } catch { }
+            }
+            Start-Sleep -Seconds 3
+            Start-Process -FilePath "$env:WINDIR\explorer.exe" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+
+            $applied = $false
+            for ($attempt = 1; $attempt -le 8; $attempt++) {
+                try {
+                    $live = Join-Path $dir 'DesktopDock64.dll'
+                    if (Test-Path -LiteralPath $live) { Remove-Item -LiteralPath $live -Force -ErrorAction SilentlyContinue }
+                    Move-Item -LiteralPath $pending -Destination $live -Force
+                    $applied = $true
+                    break
+                } catch { Start-Sleep -Seconds 2 }
+            }
+            if ($applied) { Write-Ok 'DesktopDock64.dll : patched and swapped in' }
+            else { Write-Warn ("explorer still holds the file; native image left staged at {0}" -f $pending) }
+        }
+    } else {
+        Write-Ok 'DesktopDock64.dll : patched and swapped in'
+    }
 
     # ---------------- Registry & NGEN Tune-up ----------------
     Write-Step 'refreshing .NET native images & registry'

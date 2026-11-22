@@ -24,6 +24,7 @@ $ErrorActionPreference = 'Stop'
 function Write-Ok   { param([string]$m) Write-Host "  $m" -ForegroundColor Green }
 function Write-Bad  { param([string]$m) Write-Host "  $m" -ForegroundColor Red }
 function Write-Info { param([string]$m) Write-Host "  $m" -ForegroundColor DarkGray }
+function Write-Warn { param([string]$m) Write-Host "  $m" -ForegroundColor Yellow }
 
 function Resolve-FencesDir {
     param([string] $Explicit)
@@ -85,10 +86,30 @@ try {
     Write-Info "Activation  = $($li.Activation)"
     Write-Info "Expiration  = $($li.Expiration)"
 
-    if ([int]$result -eq 0 -and [int]$li.State -eq 14 -and $li.Expiration -eq [datetime]::MaxValue) {
+    # Subscription (13) is the expected state. PermanentLicense (14) still unlocks every
+    # feature gate, but it reports the product as a perpetual purchase and hides the
+    # "Manage subscription" entry, so it is a regression for this patch set.
+    if ([int]$result -eq 0 -and [int]$li.State -eq 13 -and $li.Expiration -eq [datetime]::MaxValue) {
         Write-Ok 'PASS'
+    } elseif ([int]$result -eq 0 -and [int]$li.State -eq 14 -and $li.Expiration -eq [datetime]::MaxValue) {
+        Write-Bad 'FAIL: state is PermanentLicense (14); expected Subscription (13)'
+        Write-Info 'Apply the get_PermanentLicense byte patch (Patch-Fences.ps1 handles this)'
+        $failures++
     } else {
-        Write-Bad 'FAIL: expected Result.Success + PermanentLicense + DateTime.MaxValue'
+        Write-Bad 'FAIL: expected Result.Success + Subscription (13) + DateTime.MaxValue'
+        $failures++
+    }
+
+    # ------------------------------------------------------------------
+    # 1b. Subscription flag seen by the UI
+    # ------------------------------------------------------------------
+    try {
+        $liSub = [int]$li.State -eq 13
+        Write-Info "GetIsSubscription-equivalent = $liSub"
+        if ($liSub) { Write-Ok 'PASS: About panel exposes Manage subscription' }
+        else { Write-Bad 'FAIL: Features.GetIsSubscription() will report false'; $failures++ }
+    } catch {
+        Write-Bad ('FAIL: subscription check threw: ' + $_.Exception.Message)
         $failures++
     }
 
@@ -114,27 +135,53 @@ try {
         $v = [Enum]::Parse($fidT, $n)
         $p = $idx.GetValue($purchased, @($v))
         $s = $idxState.GetValue($states, @($v))
-        $mark = if ($p -and [int]$s -eq 14) { 'ok' } else { 'BAD' }
+
+        # Purchased_Real is `IsActivated_Purchased(All) || IsActivated_Purchased(feature)`,
+        # so once All is unlocked it reports True for every id — it is not a per-SKU probe.
+        # Feature_State similarly short-circuits to GetState(All). The honest per-SKU
+        # signal is what Sas.VerifyLicense itself returns, so ask it directly.
+        $argsSku = @([int]$v, $null)
+        $null = $m.Invoke($null, $argsSku)
+        $skuState = $argsSku[1].State
+
+        # Enterprise SKUs must stay at NoLicense or the desktop enters kiosk lock-down.
+        $isEnterprise = ($n -eq 'BusinessSKU' -or $n -eq 'ODNTLic')
+        $want = if ($isEnterprise) { 1 } else { 13 }
+        $mark = if ([int]$skuState -eq $want) { 'ok' } else { 'BAD' }
         if ($mark -eq 'BAD') { $bad += $n }
-        Write-Host ("    {0,-18} id {1,-5} purchased={2,-5} state={3}" -f $n, [int]$v, $p, $s)
+        Write-Host ("    {0,-18} id {1,-5} purchased={2,-6} verifyState={3,-14} {4}" -f `
+            $n, [int]$v, $p, $skuState, $mark)
     }
 
     if ($bad.Count -eq 0) {
-        Write-Ok ("PASS: all {0} feature gates unlocked" -f $names.Count)
+        Write-Ok ("PASS: {0} consumer gates at Subscription, 2 enterprise SKUs at NoLicense" -f ($names.Count - 2))
     } else {
-        Write-Bad ("FAIL: locked features: " + ($bad -join ', '))
+        Write-Bad ("FAIL: unexpected SKU states: " + ($bad -join ', '))
         $failures++
     }
 
     # ------------------------------------------------------------------
     # 3. SKU flags
     # ------------------------------------------------------------------
+    # IsBusinessSku / IsODNTSKU route through Settings and EnterpriseActivation, whose
+    # static constructors P/Invoke DesktopDock64.dll's GetWL/GetWLA and read HKLM. Those
+    # only resolve inside a real Fences process, so a host that cannot initialise them is
+    # reported as skipped rather than failed. The authoritative check is the
+    # per-feature Purchased flag in section 2, which is computed from Sas.VerifyLicense.
     Write-Host ''
     Write-Host 'SKU flags' -ForegroundColor Cyan
     foreach ($prop in @('IsBusinessSku', 'IsODNTSKU')) {
-        $val = $featuresT.GetProperty($prop).GetValue($null)
-        Write-Info ("{0,-16} = {1} (expected: False)" -f $prop, $val)
-        if ($val) { $failures++; Write-Bad "FAIL: $prop should remain False to avoid kiosk locking" } else { Write-Ok "$prop is cleanly disabled (safe)" }
+        try {
+            $val = $featuresT.GetProperty($prop).GetValue($null)
+            Write-Info ("{0,-16} = {1} (expected: False)" -f $prop, $val)
+            if ($val) { $failures++; Write-Bad "FAIL: $prop should remain False to avoid kiosk locking" }
+            else { Write-Ok "$prop is cleanly disabled (safe)" }
+        } catch {
+            Write-Info ("{0,-16} = skipped" -f $prop)
+            Write-Warn ("cannot evaluate outside a live Fences process: " +
+                        $_.Exception.InnerException.Message)
+            Write-Warn 'section 2 already proves the enterprise gates return NoLicense'
+        }
     }
 
     # ------------------------------------------------------------------
