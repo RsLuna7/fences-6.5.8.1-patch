@@ -52,6 +52,21 @@ Unconditionally returning `PermanentLicense` for all feature IDs sets `Features.
 When virtual display drivers (e.g., remote desktop adapters, GameViewer, NoMachine) introduce secondary displays like `\\.\DISPLAY5`, Fences triggers `/syncmultimon` background loops. This repeatedly saves and reloads layouts, reverting custom layouts back to default 4-group templates.
 - **Solution:** Setting `StoreLayoutsPerMultimon = 0` locks layout persistence to the primary desktop workarea.
 
+### 5. The Activation Nag Survives Every Patch
+After all of the above, a "license not found / Buy / Enter product key" dialog can still appear **every 30 minutes**. It does not belong to `Fences.exe`:
+
+- The window is owned by **`SdDisplay.exe`**, the activation UI host shipped with **Stardock Application Services (SAS 2.11.3.4644)**.
+- The scheduler lives in `SdAppServices_x64.dll`, loaded into `explorer.exe` / `Fences.exe`, and owns `UiTask` / `ValidateLicenseTask` / `UpdateCheckTask` / `SuspendWatchDogTask`.
+- SAS does **not** call the patched `Sas::VerifyLicense`. It reads `%ProgramData%\Stardock\Fences6\License.sig` off disk, which the patch flow renamed to `License.sig.disabled`, whose payload is an expired Trial. Native layer resolves `NoLicense`; the managed layer reports `SASState: 13` at the same time.
+
+Patching `Fences.exe` or `Stardock.ApplicationServices.dll` cannot reach this: SAS is a separate native engine with its own state.
+
+- **Solution (permanent, needs admin):** `.\scripts\Disable-SdDisplayNag.ps1` renames `SdDisplay.exe` so SAS's `ShowUI` cannot launch it. `Fences.exe` never needs that host - desktop fences, roll-up, tabs and snapshots are unaffected.
+- **Solution (no admin):** `.\scripts\FencesNoNag-Watcher.ps1` polls every 250 ms and kills the host before the window draws.
+
+Full analysis - string offsets, log cadence, the `Kill()` access-denied fallback, and the PS 5.1 BOM trap - is in **[docs/sas-display-nag.md](docs/sas-display-nag.md)**.
+
+
 ---
 
 ## Requirements
@@ -92,6 +107,20 @@ DesktopDock64.dll                 2D936968BEED21465C63FF6F5AD66B55C1261679575C82
 # 4. Revert to original binaries
 .\Patch-Fences.ps1 -Restore
 ```
+
+If the 30-minute "license not found" dialog still shows up:
+
+```powershell
+# permanent (elevated) - renames SdDisplay.exe so SAS cannot launch it
+.\scripts\Disable-SdDisplayNag.ps1
+.\scripts\Disable-SdDisplayNag.ps1 -Restore    # undo
+
+# no admin rights - polls and kills SdDisplay.exe before the window draws
+powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden `
+  -File .\scripts\FencesNoNag-Watcher.ps1
+```
+
+See [docs/sas-display-nag.md](docs/sas-display-nag.md).
 
 ---
 
